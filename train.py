@@ -84,7 +84,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 527
+    vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -197,6 +197,31 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device ="mps"
 print(f"Using device :{device}")
 
+# ----------------------------------------------------------------------------------------------------
+
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+with open("input.txt", "r") as file:
+    text = file.read()
+
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:(B*T) + 1])
+x = buf[:-1].view(B, T).to(device)
+y= buf[1:].view(B, T).to(device)
+
+model = GPT(GPTConfig()).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"Epoch {i}/50. Loss: {loss.item()}")
+
+import sys; sys.exit(0)
 
 # ----------------------------------------------------------------------------------------------------
 
