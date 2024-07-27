@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 import torch
+import torch.backends
+import torch.backends.mps
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2LMHeadModel
@@ -186,6 +188,14 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+
+# ---------------------------------------------------------------------------------------------------
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device ="mps"
+print(f"Using device :{device}")
 
 
 # ----------------------------------------------------------------------------------------------------
