@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2LMHeadModel
 import tiktoken
+import time
 
 # -----------------------------------------
 
@@ -250,20 +251,26 @@ print(f"Using device :{device}")
 
 # ----------------------------------------------------------------------------------------------------
 
-train_loader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(8, 512)
 
+torch.set_float32_matmul_precision("high")
 
 model = GPT(GPTConfig()).to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"Epoch {i}/50. Loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
+    print(f"Epoch {i}/50. Loss: {loss.item()}. dt: {dt:.2f}ms. tok/sec :{tokens_per_sec:.4f}")
 
 import sys
 
