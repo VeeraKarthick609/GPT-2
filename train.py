@@ -84,7 +84,7 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class TanHGelu(nn.Module):
+""" class TanHGelu(nn.Module):
     def forward(self, input):
         return (
             0.5
@@ -95,7 +95,7 @@ class TanHGelu(nn.Module):
                     math.sqrt(2.0 / math.pi) * (input * 0.04475 * torch.pow(input, 3.0))
                 )
             )
-        )
+        ) """
 
 
 class MLP(nn.Module):
@@ -133,7 +133,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -273,7 +273,31 @@ torch.set_float32_matmul_precision("high")
 model = GPT(GPTConfig()).to(device)
 # model = torch.compile(model) disabled due to a bug https://github.com/pytorch/pytorch/issues/120233
 
-optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+
+def get_lr(it):
+    # linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+
+    # if it > lr_decay_iters, return the minimum learning rate
+    if it > max_steps:
+        return min_lr
+
+    # in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (
+        1.0 + math.cos(math.pi * decay_ratio)
+    )  # coeff starts from 1 and goes till 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch()
@@ -282,13 +306,20 @@ for i in range(50):
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    # change lr
+    lr = get_lr(i)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000  # time difference in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
     print(
-        f"Epoch {i}/50. Loss: {loss.item()}. dt: {dt:.2f}ms. tok/sec :{tokens_per_sec:.4f}"
+        f"Epoch {i}/50 | lr {lr:.4f} | Loss: {loss.item():.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec :{tokens_per_sec:.4f}"
     )
 
 import sys
