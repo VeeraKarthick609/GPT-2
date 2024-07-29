@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 import torch
 import torch.backends
 import torch.backends.mps
@@ -81,6 +82,20 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.c_proj(y)
         return y
+
+
+class TanHGelu(nn.Module):
+    def forward(self, input):
+        return (
+            0.5
+            * input
+            * (
+                1.0
+                + torch.tanh(
+                    math.sqrt(2.0 / math.pi) * (input * 0.04475 * torch.pow(input, 3.0))
+                )
+            )
+        )
 
 
 class MLP(nn.Module):
@@ -256,6 +271,7 @@ train_loader = DataLoaderLite(8, 512)
 torch.set_float32_matmul_precision("high")
 
 model = GPT(GPTConfig()).to(device)
+# model = torch.compile(model) disabled due to a bug https://github.com/pytorch/pytorch/issues/120233
 
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 for i in range(50):
@@ -269,9 +285,11 @@ for i in range(50):
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = (t1 - t0)*1000 # time difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
-    print(f"Epoch {i}/50. Loss: {loss.item()}. dt: {dt:.2f}ms. tok/sec :{tokens_per_sec:.4f}")
+    dt = (t1 - t0) * 1000  # time difference in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(
+        f"Epoch {i}/50. Loss: {loss.item()}. dt: {dt:.2f}ms. tok/sec :{tokens_per_sec:.4f}"
+    )
 
 import sys
 
