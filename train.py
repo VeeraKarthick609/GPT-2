@@ -9,14 +9,17 @@ import torch.nn.functional as F
 from transformers import GPT2LMHeadModel
 import tiktoken
 import time
+import os
 
 # -----------------------------------------
 
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_process):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_process = num_process
 
         with open("input.txt", "r") as file:
             text = file.read()
@@ -27,7 +30,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B*T)}")
 
         # state
-        self.current_position = 0
+        self.current_position =  self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -35,10 +38,10 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
 
-        self.current_position += B * T
+        self.current_position += B * T * self.num_process
 
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_process + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
 
         return x, y
 
@@ -280,23 +283,60 @@ class GPT(nn.Module):
         return optimizer
 
 
+# --------------------------------------------------------------------------------------------------
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 # ---------------------------------------------------------------------------------------------------
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"Using device :{device}")
 
-# ----------------------------------------------------------------------------------------------------
+total_batch_size = 524288 # as per paper batch size is 5M
+B = 8
+T = 1024
+grad_accum_steps =total_batch_size // (B*T*ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(8, 512)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size)
 
 torch.set_float32_matmul_precision("high")
 
 model = GPT(GPTConfig()).to(device)
 # model = torch.compile(model) disabled due to a bug https://github.com/pytorch/pytorch/issues/120233
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model 
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -323,15 +363,24 @@ def get_lr(it):
 
 
 # optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
 for i in range(50):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps-1)
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # change lr
@@ -343,9 +392,9 @@ for i in range(50):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000  # time difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / (t1 - t0)
     print(
-        f"Epoch {i}/50 | lr {lr:.4f} | Loss: {loss.item():.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec :{tokens_per_sec:.4f}"
+        f"Epoch {i}/50 | lr {lr:.4f} | Loss: {loss_accum.item():.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec :{tokens_per_sec:.4f}"
     )
 
 import sys
