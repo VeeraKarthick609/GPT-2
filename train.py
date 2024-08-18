@@ -10,18 +10,27 @@ from transformers import GPT2LMHeadModel
 import tiktoken
 import time
 import os
+import numpy as np
 
 # -----------------------------------------
 
+def load_tokens(filename):
+    """ filename = filename.split("_")
+    filename[2] = "0"+filename[2]
+    filename = "_".join(filename) """
+    npt = np.load("./edu_fineweb10B/"+filename)
+    ptt = torch.tensor(npt, dtype = torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_process):
+    def __init__(self, B, T, process_rank, num_process, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_process = num_process
+        assert split in {'train', 'val'}
 
-        with open("input.txt", "r") as file:
+        """ with open("input.txt", "r") as file:
             text = file.read()
         enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
@@ -30,7 +39,22 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B*T)}")
 
         # state
-        self.current_position =  self.B * self.T * self.process_rank
+        self.current_position =  self.B * self.T * self.process_rank """
+
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process :
+            print(f"found {len(shards)} shards for split {split}")
+        
+        #state, init at shard zero
+        self.current_shard =0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -41,7 +65,9 @@ class DataLoaderLite:
         self.current_position += B * T * self.num_process
 
         if self.current_position + (B * T * self.num_process + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
 
         return x, y
 
@@ -313,7 +339,7 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size, split="train")
 
 torch.set_float32_matmul_precision("high")
 
@@ -326,8 +352,8 @@ raw_model = model.module if ddp else model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 
 
 def get_lr(it):
@@ -350,7 +376,7 @@ def get_lr(it):
 
 # optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
-for i in range(50):
+for i in range(max_steps):
     t0 = time.time()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -380,7 +406,7 @@ for i in range(50):
     dt = (t1 - t0) * 1000  # time difference in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / (t1 - t0)
     print(
-        f"Epoch {i}/50 | lr {lr:.4f} | Loss: {loss_accum.item():.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec :{tokens_per_sec:.4f}"
+        f"Epoch {i}/{max_steps} | lr {lr:.4f} | Loss: {loss_accum.item():.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec :{tokens_per_sec:.4f}"
     )
 
 import sys
