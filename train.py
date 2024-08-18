@@ -50,8 +50,10 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process :
             print(f"found {len(shards)} shards for split {split}")
-        
+        self.reset()
+
         #state, init at shard zero
+    def reset(self):
         self.current_shard =0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
@@ -332,7 +334,7 @@ device_type = "cuda" if device.startswith("cuda") else "cpu"
 # ---------------------------------------------------------------------------------------------------
 
 total_batch_size = 524288 # as per paper batch size is 5M
-B = 8
+B = 64
 T = 1024
 grad_accum_steps =total_batch_size // (B*T*ddp_world_size)
 if master_process:
@@ -340,6 +342,7 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision("high")
 
@@ -376,7 +379,32 @@ def get_lr(it):
 
 # optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
-for i in range(max_steps):
+for step in range(max_steps):
+
+    # validation loop
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            
+
+
+
+    # training loop
+    model.train()
     t0 = time.time()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -406,6 +434,6 @@ for i in range(max_steps):
     dt = (t1 - t0) * 1000  # time difference in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / (t1 - t0)
     print(
-        f"Epoch {i}/{max_steps} | lr {lr:.4f} | Loss: {loss_accum.item():.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec :{tokens_per_sec:.4f}"
+        f"Epoch {step}/{max_steps} | lr {lr:.4f} | Loss: {loss_accum.item():.4f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec :{tokens_per_sec:.4f}"
     )
 
