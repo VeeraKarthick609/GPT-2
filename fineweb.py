@@ -23,6 +23,8 @@ shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
+print(f"Saving files to: {DATA_CACHE_DIR}")
+
 # download the dataset
 fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
 
@@ -68,6 +70,7 @@ with mp.Pool(nprocs) as pool:
             remainder = shard_size - token_count
             progress_bar.update(remainder)
             all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
+            print(f"Saving to {filename}")
             write_datafile(filename, all_tokens_np)
             shard_index += 1
             progress_bar = None
@@ -79,4 +82,5 @@ with mp.Pool(nprocs) as pool:
     if token_count != 0:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
+        
         write_datafile(filename, all_tokens_np[:token_count])
